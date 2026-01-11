@@ -18,10 +18,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ### Testing
 - `npm run test` - Run all tests with Vitest (jsdom environment)
 - `npm run test -- --watch` - Run tests in watch mode
-- `npm run test -- src/lib/file-system.ts` - Run tests for a specific file
+- `npm run test -- src/lib/__tests__/file-system.test.ts` - Run tests for a specific file
 
 ### Database
-- `npm setup` - Install dependencies, generate Prisma client, and run migrations
+- `npm run setup` - Install dependencies, generate Prisma client, and run migrations
 - `npm run db:reset` - Reset database to initial state (deletes all data, useful for development)
 
 ### Environment Setup
@@ -43,7 +43,7 @@ The app maintains an **in-memory virtual file system** that never writes to disk
 - **VirtualFileSystem** (`src/lib/file-system.ts`): Core implementation with methods like `createFile()`, `viewFile()`, `replaceInFile()`, `serialize()`, etc.
 - State managed via **FileSystemContext** (`src/lib/contexts/file-system-context.tsx`)
 - Full state (all files) serialized to JSON and stored in database as `project.data`
-- Supports file operations through AI tool calls: `str_replace_editor` (edit/create) and `file_manager` (rename/delete)
+- Supports file operations through AI tool calls: `str_replace_editor` and `file_manager`
 
 ### AI Component Generation Flow
 
@@ -51,17 +51,19 @@ The app maintains an **in-memory virtual file system** that never writes to disk
 2. Chat submits to `/api/chat/route.ts` with message history and serialized file system
 3. API endpoint streams Claude responses using Vercel AI SDK (`ai` package)
 4. Claude uses tools to create/edit files in virtual file system
-5. Client-side FileSystemContext processes tool results and updates state
-6. Preview auto-refreshes when files change
+5. Client-side FileSystemContext processes tool results via `handleToolCall` and updates state
+6. Preview auto-refreshes when files change (via `refreshTrigger`)
 7. On completion, full state persists to database (if authenticated)
 
 ### Live Preview System
 
 - **Preview Component** (`src/components/preview/PreviewFrame.tsx`): Renders React components in an iframe
 - **JSX Transformation** (`src/lib/transform/jsx-transformer.ts`): Babel transpiles TypeScript/JSX to vanilla JS
-- **Import Resolution**: Custom logic resolves local imports (from virtual file system) and external packages
+- **Import Resolution**: Creates import map with blob URLs for local files and esm.sh URLs for packages
+- **Tailwind CSS**: Loaded via CDN (`https://cdn.tailwindcss.com`) in preview iframe
 - **Entry Point**: Always uses `App.jsx` (or `App.tsx`) as the root component
-- Components execute in isolated iframe scope with error handling
+- **Error Handling**: ErrorBoundary wraps component, syntax errors displayed inline
+- **CSS Support**: CSS files collected and injected as `<style>` tags in preview
 
 ### File Organization & Key Directories
 
@@ -77,12 +79,13 @@ The app maintains an **in-memory virtual file system** that never writes to disk
 | `src/lib/transform/` | JSX compilation and import resolution |
 | `src/actions/` | Next.js Server Actions for auth and project management |
 | `src/middleware.ts` | JWT session validation for protected routes |
+| `src/generated/prisma/` | Generated Prisma client (auto-generated, do not edit) |
 | `prisma/` | Database schema and migrations |
 
 ### Data Models
 
-**User**: Email, hashed password, timestamp fields
-**Project**: Name, messages (JSON string of chat history), data (serialized file system JSON), user relationship, timestamps
+**User**: `id`, `email`, `password` (hashed), `createdAt`, `updatedAt`
+**Project**: `id`, `name`, `userId` (optional), `messages` (JSON string), `data` (serialized file system JSON), `createdAt`, `updatedAt`
 
 Projects can be:
 - **Authenticated**: Associated with a user, persisted to database
@@ -91,24 +94,26 @@ Projects can be:
 ### Authentication & Authorization
 
 - **JWT-based sessions** stored in HTTP-only cookies (7-day expiration)
-- **Middleware** (`src/middleware.ts`) validates sessions for protected routes
-- **Anonymous access** allowed for chat preview; persistence requires authentication
+- **Middleware** (`src/middleware.ts`) validates sessions for protected routes (`/api/projects`, `/api/filesystem`)
+- **Anonymous access** allowed for chat/preview; persistence requires authentication
 - Server Actions in `src/actions/` handle signup, signin, signout, project CRUD
 - Password hashing with bcrypt
 
 ### AI Provider Architecture
 
 - **Provider abstraction** (`src/lib/provider.ts`): Toggles between real Claude (Anthropic API) and mock provider
-- Real provider: Uses `@ai-sdk/anthropic` with prompt caching
+- **Model**: `claude-haiku-4-5` via `@ai-sdk/anthropic`
+- Real provider: Uses Anthropic API with prompt caching via `cacheControl: { type: "ephemeral" }`
 - Mock provider: Returns static component templates (fallback when no API key)
-- System prompt injection with Anthropic prompt caching for consistent instructions
-- Supports up to 40 tool-use steps per request
+- System prompt defined in `src/lib/prompts/generation.tsx`
+- Supports up to 40 tool-use steps per request (4 for mock), max 10,000 tokens
+- API route has `maxDuration = 120` seconds for long-running requests
 
 ### Key Technology Stack
 
 - **Frontend**: React 19, TypeScript, Tailwind CSS v4, Radix UI components, Monaco Editor
 - **Backend**: Next.js 15 API Routes + Server Actions
-- **AI**: Vercel AI SDK, Anthropic Claude API
+- **AI**: Vercel AI SDK (`ai` package), Anthropic Claude API (`@ai-sdk/anthropic`)
 - **Database**: Prisma ORM + SQLite
 - **Development**: Turbopack, Vitest, ESLint
 
@@ -117,7 +122,7 @@ Projects can be:
 - **TypeScript paths**: `@/*` maps to `src/*` for clean imports
 - **Tailwind**: Configured with Radix UI colors and Tailwind UI typography plugin
 - **Next.js**: Dev indicators disabled (cleaner dev experience)
-- **Vitest**: Runs in jsdom environment for DOM testing
+- **Vitest**: Runs in jsdom environment for DOM testing (`vitest.config.mts`)
 
 ## Important Implementation Details
 
@@ -125,28 +130,65 @@ Projects can be:
 
 The virtual file system is serialized to JSON for storage. When loading a project:
 1. Fetch project from database
-2. Deserialize `project.data` JSON string back to file system
+2. Deserialize `project.data` JSON string back to file system via `deserializeFromNodes()`
 3. Deserialize `project.messages` (chat history)
 4. UI auto-populates with previous state
 
 ### Chat Message Structure
 
 Messages include:
-- `role`: 'user' | 'assistant'
+- `role`: 'user' | 'assistant' | 'system'
 - `content`: Text content
 - `toolInvocations`: (for assistant messages) Array of tool calls made by Claude
 - Tool results tracked separately for AI context
 
-### Tool Implementation Pattern
+### AI Tools
 
-Tools are defined in the system prompt and implemented in `src/lib/tools/`:
-- **str_replace_editor**: Create files, view files, replace content (handles multi-step edits)
-- **file_manager**: Rename and delete files
-- Client processes tool calls via `onToolCall` callback in FileSystemContext
-- Tool results sent back to LLM for multi-turn interactions
+Tools are defined with Zod schemas in `src/lib/tools/`:
+
+**str_replace_editor** - Text editor operations:
+- `view`: View file content with optional line range (`view_range`)
+- `create`: Create new file with content (`file_text`)
+- `str_replace`: Replace text (`old_str` -> `new_str`)
+- `insert`: Insert text at line number (`insert_line`, `new_str`)
+- `undo_edit`: Not supported (returns error message)
+
+**file_manager** - File operations:
+- `rename`: Rename/move file (`path` -> `new_path`)
+- `delete`: Delete file or directory (`path`)
+
+### Preview Import Resolution
+
+The JSX transformer (`src/lib/transform/jsx-transformer.ts`) handles imports:
+1. Local files: Transformed with Babel, converted to blob URLs
+2. Third-party packages: Resolved via `https://esm.sh/{package}`
+3. Missing local imports: Placeholder modules created
+4. `@/` alias: Maps to root directory (`/`)
+5. CSS imports: Extracted and injected as inline styles
+
+### System Prompt (Component Generation)
+
+Located in `src/lib/prompts/generation.tsx`, the prompt enforces:
+- Root `/App.jsx` file requirement
+- Tailwind CSS only (no inline styles or CSS files)
+- Consistent design system (color palette, typography, spacing)
+- `lucide-react` for icons
+- Accessibility best practices
+- Mobile-first responsive design
 
 ## Testing Notes
 
 - Tests run in jsdom environment (DOM available in tests)
-- Testing Library for React component testing
-- Key files to test: VirtualFileSystem logic, JSX transformation, auth flows
+- Testing Library for React component testing (`@testing-library/react`)
+- Vitest config in `vitest.config.mts` with tsconfig paths support
+- Test files located in `__tests__/` directories alongside source files
+- Key areas to test: VirtualFileSystem logic, JSX transformation, auth flows, React contexts
+
+## Code Conventions
+
+- Use TypeScript for all new code
+- Prefer functional components with hooks
+- Use `@/` import alias for all internal imports
+- Keep components focused and composable
+- Use descriptive variable names
+- Follow existing patterns in the codebase
